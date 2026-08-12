@@ -396,6 +396,25 @@ class TestMainFunction:
         assert call_args[0] == "skip"
         assert "processing" in call_args[1].lower()
 
+    def test_skips_when_already_scanned_today(self, mock_common_module):
+        """Skips when a scan task with today's date already exists."""
+        from datetime import datetime, timezone
+
+        mock_common_module.get_capacity.return_value = (0, 10)
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        mock_common_module.get_tasks.return_value = [
+            {"external_key": f"test-scan:insights-chrome:{today}", "status": "done"}
+        ]
+
+        spec.loader.exec_module(scan_module)
+        scan_module.main()
+
+        mock_common_module.output_result.assert_called_once()
+        call_args = mock_common_module.output_result.call_args[0]
+        assert call_args[0] == "skip"
+        assert "already scanned today" in call_args[1].lower()
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
