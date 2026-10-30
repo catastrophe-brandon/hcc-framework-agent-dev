@@ -1,0 +1,53 @@
+{
+  "base_issue": {
+    "key": "UITEST-LOCAL-1",
+    "fields": {
+      "status": {
+        "name": "To Do"
+      },
+      "labels": [
+        "ui-test"
+      ],
+      "created": "2026-01-01T00:00:00Z",
+      "updated": "2026-01-01T00:00:00Z",
+      "issuetype": {
+        "name": "Task"
+      }
+    },
+    "comments": []
+  },
+  "description_template": "Application: {application}\nEnvironment: {environment}\nTarget URL: {target_url}\nTest profile alias: {profile_alias}\nGoal: {goal}\nExpected: {expected}\nScope: {scope}{discovery_notes}",
+  "scenarios": {
+    "auth-dashboard": {
+      "summary": "Verify Stage sign-in and dashboard landing",
+      "goal": "Authenticate with the configured test account and verify landing on the HCC dashboard.",
+      "expected": "Sign-in completes and the user reaches a usable Hybrid Cloud Console dashboard with the active account/org context clear.",
+      "scope": "Check authentication and the initial dashboard only. Read-only; do not create, edit, or delete data."
+    },
+    "dashboard-widgets": {
+      "summary": "Explore HCC dashboard widgets and map test coverage",
+      "goal": "Explore the dashboard and widget library. Develop detailed test cases for adding, removing, restoring, reordering, and resizing widgets, and for exercising each widget's user-facing capabilities.",
+      "expected": "Inventory the dashboard widgets and library, exercise representative widget management and widget capabilities, and document tester-ready cases with step-by-step actions and verified semantic locators for all discovered functionality. Mark unexecuted cases not run and record results, risks, and coverage gaps.",
+      "scope": "Keep exploration bounded: test representative behavior and do not exhaustively execute every drafted case in this run. If an interaction remains unclear after two attempts, record the gap and continue. Use the designated mutable test account. Record the initial dashboard layout and each mutation. Limit mutations to dashboard widget layout. Do not create or modify underlying service/customer data or use irreversible reset actions."
+    },
+    "dashboard-widgets-report": {
+      "summary": "Produce detailed HCC dashboard widget test plan",
+      "goal": "Verify the current dashboard and widget-library inventory, then use the recorded Stage discovery notes below to write a complete, tester-ready widget test plan and results report. Keep each case step-by-step and include relevant verified semantic locators for every UI interaction. Clearly distinguish observations verified this run from prior discovery notes and mark unexecuted cases not run.",
+      "expected": "A readable Markdown report with a separate detailed section for each test case, atomic numbered actions, semantic locators, expected and observed results, status, risks, assumptions, and coverage gaps.",
+      "scope": "Read-only report pass. You may inspect the dashboard and open then close the Add widgets library. Do not add, remove, reorder, resize, or otherwise mutate widgets. Do not claim prior observations were retested in this run. If the current layout differs from the recorded baseline, document the difference and do not attempt to repair it.",
+      "discovery_notes": "Prior Stage exploration on 2026-10-14: after removing an extra Quay.io widget, the 10-widget dashboard baseline was verified as Red Hat Enterprise Linux, Red Hat OpenShift, Ansible Automation Platform, Recently visited, My favorite services, Subscriptions, Explore capabilities, Red Hat OpenShift AI, Image Builder, and Advanced Cluster Security. The Add widgets library listed My support cases, Bookmarked learning resources, Events, and Integrations. The Add widgets trigger was observed as a button with accessible name Add widgets. Tray add handles did not expose consistent semantic controls; click and simulated drag did not add a widget. One run found 3 of 4 tray tiles had no interactive accessibility-tree entry; the remaining entry was an unlabeled generic button. Removing a widget from its Widget actions menu worked. A later read-only run found the Red Hat Enterprise Linux widget missing; a cleanup attempt did not confirm restoration. Restore-by-drag remains unverified. Maximize height and Minimize height worked and returned the card to its prior size. Subscriptions Active linked to /subscriptions/inventory?status=active. Recently visited placed Subscription Services first after visiting Subscriptions. The My favorite services empty state included a View all services link. Explore capabilities links were inventoried but not click-tested. These are historical observations; verify current layout and locators only, and label historical outcomes as prior-run results."
+    },
+    "insights-chrome-shell": {
+      "summary": "Assess insights-chrome masthead and landing shell",
+      "goal": "Assess the signed-in Hybrid Cloud Console landing page and the insights-chrome masthead. Check that the landing page renders, then inspect the masthead and exercise representative flows for service navigation/All Services, global search, notifications, settings, the user menu, sidebar visibility, and favorite services. Produce a complete tester-ready plan with detailed actions and verified semantic locators.",
+      "expected": "A readable Markdown report with landing-page and masthead findings, detailed step-by-step cases, per-action semantic locators, expected and observed results, status, risks, assumptions, and coverage gaps.",
+      "scope": "Use the configured Stage test account. Start after sign-in and do not test or alter authentication, org membership, or account roles. Set the browser to 1280x800. Check the landing page's primary heading and visible content, then test each listed masthead surface once. Do not inspect every service category, open the Help panel, or exhaustively inspect submenus. After one representative observation per surface, stop exploring and write the report; mark remaining paths not run. Limit exploration to 30 browser interactions. For favorites, record the full initial set, change one non-favorited service, and verify the original set is restored. Do not change service data, appearance preferences, subscriptions, or persistent org settings; do not log out. Keep names, usernames, account numbers, and org IDs out of reports and memory; refer only to the requested persona."
+    },
+    "local-default": {
+      "summary": "Explore the ephemeral console using the UI test harness",
+      "goal": "Explore the signed-in console and check the Subscriptions and Inventory views.",
+      "expected": "The requested profile can sign in; both views open and show their fixture content.",
+      "scope": "No production data or mutations are in scope."
+    }
+  }
+}
