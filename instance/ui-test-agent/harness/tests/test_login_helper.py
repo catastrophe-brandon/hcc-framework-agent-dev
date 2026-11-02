@@ -4,37 +4,37 @@ import asyncio
 import importlib.util
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 HELPER_PATH = (
     Path(__file__).resolve().parents[2] / "agent" / "login-helper" / "server.py"
 )
 ENVIRONMENT_KEYS = (
+    "UI_TEST_CREDENTIALS_DIR",
     "UI_TEST_USERNAME",
     "UI_TEST_PASSWORD",
     "UI_HARNESS_PROFILE",
-    "UI_TEST_CREDENTIALS_DIR",
+    "UI_HARNESS_SHOW_COOKIE_PROMPT",
 )
 
 
-class FakeFastMCP:
-    def __init__(self, _name: str):
-        self.tools = []
+class FakeRoute:
+    def __init__(self, path, endpoint, methods=None):
+        self.path = path
+        self.endpoint = endpoint
+        self.methods = methods
 
-    def custom_route(self, *_args, **_kwargs):
-        return lambda function: function
 
-    def tool(self):
-        def register(function):
-            self.tools.append(function)
-            return function
-
-        return register
+class FakeStarlette:
+    def __init__(self, routes):
+        self.routes = routes
 
 
 class FakeJSONResponse:
@@ -52,27 +52,24 @@ class FakeRequest:
 
 
 def load_helper_module():
-    """Import the helper with small MCP/Starlette stubs for offline testing."""
-    mcp = ModuleType("mcp")
-    mcp.__path__ = []
-    mcp_server = ModuleType("mcp.server")
-    mcp_server.__path__ = []
-    fastmcp = ModuleType("mcp.server.fastmcp")
-    fastmcp.FastMCP = FakeFastMCP
+    """Import the helper with small Starlette stubs for offline testing."""
     starlette = ModuleType("starlette")
     starlette.__path__ = []
+    applications = ModuleType("starlette.applications")
+    applications.Starlette = FakeStarlette
     requests = ModuleType("starlette.requests")
     requests.Request = type("Request", (), {})
     responses = ModuleType("starlette.responses")
     responses.JSONResponse = FakeJSONResponse
+    routing = ModuleType("starlette.routing")
+    routing.Route = FakeRoute
 
     stubs = {
-        "mcp": mcp,
-        "mcp.server": mcp_server,
-        "mcp.server.fastmcp": fastmcp,
         "starlette": starlette,
+        "starlette.applications": applications,
         "starlette.requests": requests,
         "starlette.responses": responses,
+        "starlette.routing": routing,
     }
     saved_environment = {name: os.environ.get(name) for name in ENVIRONMENT_KEYS}
     for name in ENVIRONMENT_KEYS:
@@ -98,6 +95,25 @@ def load_helper_module():
                 os.environ[name] = value
 
 
+def completed_login(status="authenticated", submitted=True):
+    return SimpleNamespace(
+        returncode=0,
+        communicate=Mock(
+            return_value=(
+                json.dumps(
+                    {
+                        "status": status,
+                        "credential_submission_started": submitted,
+                        "message": "secret-pass test-user",
+                        "password": "secret-pass",
+                    }
+                ),
+                None,
+            )
+        ),
+    )
+
+
 class LoginHelperTests(unittest.TestCase):
     def setUp(self):
         self.helper = load_helper_module()
@@ -119,115 +135,173 @@ class LoginHelperTests(unittest.TestCase):
 
     def test_resolves_a_complete_file_profile_and_strips_newlines(self):
         self.write_credentials()
-
         self.assertEqual(
             self.helper._credentials_for("org-admin"),
             ("test-user", "secret-pass"),
         )
-        self.assertTrue(self.helper._is_configured_alias("org-admin"))
 
     def test_rejects_invalid_unknown_and_incomplete_profiles(self):
         self.write_credentials(alias="viewer", password="")
-
         self.assertIsNone(self.helper._credentials_for("../org-admin"))
         self.assertIsNone(self.helper._credentials_for("unknown"))
         self.assertIsNone(self.helper._credentials_for("viewer"))
-        self.assertFalse(self.helper._is_configured_alias("../org-admin"))
 
-    def test_environment_profile_requires_matching_alias_and_both_values(self):
-        self.helper.USERNAME = "env-user"
-        self.helper.PASSWORD = "env-pass"
-        self.helper.HARNESS_ALIAS = "viewer"
+    def test_harness_profile_uses_only_its_explicit_environment_credentials(self):
+        self.helper.HARNESS_PROFILE = "viewer"
+        self.helper.HARNESS_USERNAME = "fixture-user"
+        self.helper.HARNESS_PASSWORD = "fixture-pass"
 
         self.assertEqual(
-            self.helper._credentials_for("viewer"), ("env-user", "env-pass")
+            self.helper._credentials_for("viewer"),
+            ("fixture-user", "fixture-pass"),
         )
         self.assertIsNone(self.helper._credentials_for("org-admin"))
 
-        self.helper.PASSWORD = ""
-        self.assertIsNone(self.helper._credentials_for("viewer"))
-
     def test_sign_in_passes_credentials_only_to_child_and_sanitizes_its_output(self):
         self.write_credentials()
-        child_output = json.dumps(
-            {
-                "status": "authenticated",
-                "credential_submission_started": True,
-                "message": "secret-pass test-user",
-                "password": "secret-pass",
-            }
-        )
-        completed = SimpleNamespace(returncode=0, stdout=child_output, stderr="")
-
+        process = completed_login()
         with (
             patch.object(self.helper.shutil, "which", return_value="/usr/bin/node"),
-            patch.object(self.helper.subprocess, "run", return_value=completed) as run,
+            patch.object(
+                self.helper.subprocess, "Popen", return_value=process
+            ) as popen,
         ):
             result = self.helper.sign_in("org-admin")
 
-        passed_environment = run.call_args.kwargs["env"]
+        passed_environment = popen.call_args.kwargs["env"]
         self.assertEqual(passed_environment["UI_TEST_USERNAME"], "test-user")
         self.assertEqual(passed_environment["UI_TEST_PASSWORD"], "secret-pass")
         self.assertNotIn("JIRA_TOKEN", passed_environment)
         self.assertEqual(result["status"], "authenticated")
         self.assertEqual(result["profile_alias"], "org-admin")
         self.assertNotIn("secret-pass", json.dumps(result))
-        self.assertNotIn("test-user", json.dumps(self.helper.attempts))
-        self.assertNotIn("secret-pass", json.dumps(self.helper.attempts))
+        self.assertNotIn("test-user", json.dumps(result))
+        self.assertEqual(
+            process.communicate.call_args.kwargs["timeout"],
+            self.helper.BROWSER_LOGIN_TIMEOUT_SECONDS,
+        )
+
+    def test_credentials_are_entered_before_session_transfer_to_shared_cdp(self):
+        script = (HELPER_PATH.parent / "browser-login.mjs").read_text(encoding="utf-8")
+        login_flow = script.split("async function runLogin", 1)[1].split(
+            "async function closeBrowsers", 1
+        )[0]
+        private_launch = login_flow.split("browsers.login = loginBrowser", 1)[0]
+
+        self.assertLess(
+            login_flow.index("chromium.launch"),
+            login_flow.index("await redHatSsoLogin"),
+        )
+        self.assertLess(
+            login_flow.index("await redHatSsoLogin"),
+            login_flow.index("await transferSession(await context.storageState()"),
+        )
+        self.assertNotIn("connectOverCDP", login_flow)
+        self.assertNotIn("--remote-debugging-port", private_launch)
+        self.assertIn("delete env.UI_TEST_USERNAME", script)
+        self.assertIn("delete env.UI_TEST_PASSWORD", script)
+
+    def test_successful_submission_starts_the_password_cooldown(self):
+        self.write_credentials()
+        process = completed_login()
+        with (
+            patch.object(self.helper.shutil, "which", return_value="/usr/bin/node"),
+            patch.object(
+                self.helper.subprocess, "Popen", return_value=process
+            ) as popen,
+            patch.object(self.helper.time, "monotonic", side_effect=[100, 101, 102]),
+        ):
+            first = self.helper.sign_in("org-admin")
+            second = self.helper.sign_in("org-admin")
+
+        self.assertEqual(first["status"], "authenticated")
+        self.assertEqual(second["status"], "blocked")
+        self.assertEqual(popen.call_count, 1)
 
     def test_failed_submission_blocks_another_password_attempt(self):
         self.write_credentials()
-        completed = SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps({"status": "authentication_failed"}),
-            stderr="",
-        )
-
+        process = completed_login("authentication_failed")
         with (
             patch.object(self.helper.shutil, "which", return_value="/usr/bin/node"),
-            patch.object(self.helper.subprocess, "run", return_value=completed) as run,
+            patch.object(
+                self.helper.subprocess, "Popen", return_value=process
+            ) as popen,
         ):
             first = self.helper.sign_in("org-admin")
             second = self.helper.sign_in("org-admin")
 
         self.assertEqual(first["status"], "authentication_failed")
         self.assertEqual(second["status"], "blocked")
-        self.assertEqual(run.call_count, 1)
+        self.assertEqual(popen.call_count, 1)
 
-    def test_failed_submission_cooldown_expires_for_a_later_cycle(self):
+    def test_later_cycle_can_switch_personas_after_the_cooldown(self):
         self.write_credentials()
-        completed = SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps({"status": "authentication_failed"}),
-            stderr="",
-        )
-
+        self.write_credentials("non-org-admin", "viewer-user", "viewer-pass")
+        processes = [completed_login(), completed_login()]
         with (
             patch.object(self.helper.shutil, "which", return_value="/usr/bin/node"),
-            patch.object(self.helper.subprocess, "run", return_value=completed) as run,
+            patch.object(
+                self.helper.subprocess, "Popen", side_effect=processes
+            ) as popen,
             patch.object(
                 self.helper.time, "monotonic", side_effect=[100, 101, 401, 402]
             ),
         ):
             first = self.helper.sign_in("org-admin")
-            second = self.helper.sign_in("org-admin")
+            second = self.helper.sign_in("non-org-admin")
 
-        self.assertEqual(first["status"], "authentication_failed")
-        self.assertEqual(second["status"], "authentication_failed")
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(first["profile_alias"], "org-admin")
+        self.assertEqual(second["profile_alias"], "non-org-admin")
+        self.assertEqual(
+            [call.kwargs["env"]["UI_TEST_USERNAME"] for call in popen.call_args_list],
+            ["test-user", "viewer-user"],
+        )
+
+    def test_alias_is_not_reported_without_a_credential_submission(self):
+        self.write_credentials()
+        process = completed_login(submitted=False)
+        with (
+            patch.object(self.helper.shutil, "which", return_value="/usr/bin/node"),
+            patch.object(self.helper.subprocess, "Popen", return_value=process),
+        ):
+            result = self.helper.sign_in("org-admin")
+
+        self.assertEqual(result["status"], "login_unconfirmed")
+        self.assertNotIn("profile_alias", result)
+
+    def test_timeout_sends_sigterm_before_returning_a_blocker(self):
+        self.write_credentials()
+        process = SimpleNamespace(
+            pid=123,
+            returncode=-signal.SIGTERM,
+            communicate=Mock(
+                side_effect=[
+                    subprocess.TimeoutExpired("node", 240),
+                    ("", None),
+                ]
+            ),
+            send_signal=Mock(),
+        )
+        with (
+            patch.object(self.helper.shutil, "which", return_value="/usr/bin/node"),
+            patch.object(self.helper.subprocess, "Popen", return_value=process),
+        ):
+            result = self.helper.sign_in("org-admin")
+
+        self.assertEqual(result["status"], "blocked")
+        process.send_signal.assert_called_once_with(signal.SIGTERM)
 
     def test_unknown_alias_is_not_echoed_or_sent_to_node(self):
         with (
             patch.object(self.helper.shutil, "which", return_value="/usr/bin/node"),
-            patch.object(self.helper.subprocess, "run") as run,
+            patch.object(self.helper.subprocess, "Popen") as popen,
         ):
             result = self.helper.sign_in("private-alias-name")
 
         self.assertEqual(result["status"], "blocked")
         self.assertNotIn("profile_alias", result)
         self.assertNotIn("private-alias-name", json.dumps(result))
-        self.assertNotIn("private-alias-name", json.dumps(self.helper.attempts))
-        run.assert_not_called()
+        popen.assert_not_called()
 
     def test_http_endpoint_accepts_only_a_profile_alias(self):
         result = {"status": "authenticated", "profile_alias": "org-admin"}
@@ -246,6 +320,23 @@ class LoginHelperTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.content, {"status": "browser_unavailable"})
+
+    def test_production_app_does_not_expose_harness_state(self):
+        paths = [route.path for route in self.helper.create_app().routes]
+        self.assertNotIn("/__harness/state", paths)
+
+    def test_harness_state_is_bounded_and_enabled_only_in_local_mode(self):
+        self.helper.HARNESS_PROFILE = "viewer"
+        self.helper.attempts.clear()
+        for index in range(self.helper.attempts.maxlen + 2):
+            self.helper.attempts.append({"status": "blocked", "index": index})
+
+        paths = [route.path for route in self.helper.create_app().routes]
+        response = asyncio.run(self.helper.harness_state(FakeRequest(b"")))
+
+        self.assertIn("/__harness/state", paths)
+        self.assertEqual(len(response.content["attempts"]), 100)
+        self.assertEqual(response.content["attempts"][0]["index"], 2)
 
     def test_http_endpoint_rejects_credentials_and_extra_fields(self):
         request = FakeRequest(
@@ -271,7 +362,7 @@ class LoginHelperTests(unittest.TestCase):
             patch.object(self.helper, "_chromium_cdp_ready", return_value=True),
             patch.object(self.helper.subprocess, "Popen") as popen,
         ):
-            process = self.helper._start_chromium()
+            process = self.helper._start_chromium(Path(self.tempdir.name))
 
         self.assertIsNone(process)
         popen.assert_not_called()
@@ -286,13 +377,14 @@ class LoginHelperTests(unittest.TestCase):
             ) as popen,
             patch.dict(os.environ, {"UI_BROWSER_PROXY": "http://proxy:3128"}),
         ):
-            started = self.helper._start_chromium()
+            started = self.helper._start_chromium(Path(self.tempdir.name))
 
         self.assertIs(started, process)
         command = popen.call_args.args[0]
         self.assertIn("--proxy-server=http://proxy:3128", command)
         self.assertEqual(popen.call_args.kwargs["env"].get("UI_BROWSER_PROXY"), None)
         self.assertNotIn("UI_TEST_USERNAME", popen.call_args.kwargs["env"])
+        self.assertIn(f"--user-data-dir={self.tempdir.name}/profile", command)
 
     def test_chromium_does_not_start_without_a_browser_proxy(self):
         with (
@@ -302,7 +394,7 @@ class LoginHelperTests(unittest.TestCase):
             patch.dict(os.environ, {"UI_BROWSER_PROXY": ""}),
             self.assertRaisesRegex(RuntimeError, "UI_BROWSER_PROXY"),
         ):
-            self.helper._start_chromium()
+            self.helper._start_chromium(Path(self.tempdir.name))
 
         popen.assert_not_called()
 

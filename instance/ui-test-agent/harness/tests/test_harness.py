@@ -165,6 +165,32 @@ class PreflightHarnessTests(unittest.TestCase):
         self.assertEqual(jira.calls[0][0], "jira_search")
         self.assertEqual(memory.calls[0][0], "task_list")
 
+    def test_ticket_after_first_jira_page_is_selected(self):
+        issues = [issue(f"UITEST-LOCAL-{index}") for index in range(1, 22)]
+
+        class PagedJira(FakeJira):
+            def call(self, name, arguments):
+                if name != "jira_search":
+                    return super().call(name, arguments)
+                self.calls.append((name, arguments.copy()))
+                if arguments.get("page_token") == "page-2":
+                    return {"issues": issues[20:]}
+                return {"issues": issues[:20], "next_page_token": "page-2"}
+
+        jira = PagedJira(issues)
+        tasks = []
+        for ticket in issues[:20]:
+            task = task_record("done")
+            task["external_key"] = ticket["key"]
+            tasks.append(task)
+
+        results = run_preflight(jira, FakeMemory(tasks=tasks))
+
+        self.assertEqual(results[0][0], "start")
+        self.assertIn("UITEST-LOCAL-21", results[0][1])
+        self.assertEqual(len(jira.calls), 2)
+        self.assertEqual(jira.calls[1][1]["page_token"], "page-2")
+
     def test_new_ticket_waits_when_task_capacity_is_full(self):
         jira = FakeJira([issue()])
 
@@ -202,7 +228,9 @@ class PreflightHarnessTests(unittest.TestCase):
 
         self.assertEqual(results[0][0], "start")
         self.assertIn("human reply received", results[0][1])
-        self.assertIn("Please retry the flow.", results[0][1])
+        self.assertIn("Newest triggering comment: 2026-02-01T12:00:00Z", results[0][1])
+        self.assertNotIn("Please retry the flow.", results[0][1])
+        self.assertIn("Fetch its full text", results[0][1])
 
     def test_completed_task_routes_new_human_followup_not_report_mention(self):
         comments = [
@@ -223,7 +251,7 @@ class PreflightHarnessTests(unittest.TestCase):
 
         self.assertEqual(results[0][0], "start")
         self.assertIn("assess whether it requests a retest", results[0][1])
-        self.assertIn("missed the settings menu", results[0][1])
+        self.assertNotIn("missed the settings menu", results[0][1])
 
     def test_completed_task_ignores_old_and_agent_generated_comments(self):
         comments = [
@@ -253,7 +281,7 @@ class PreflightHarnessTests(unittest.TestCase):
         results = run_preflight(jira, memory)
         self.assertEqual(results[0][0], "start")
         self.assertIn("explicit retest request", results[0][1])
-        self.assertIn("/retest", results[0][1])
+        self.assertNotIn("/retest", results[0][1])
         self.assertEqual(
             [name for name, _ in jira.calls], ["jira_search", "jira_get_issue"]
         )
@@ -324,9 +352,10 @@ class RuntimeHarnessTests(unittest.TestCase):
             "\n"
             "def main():\n"
             "    try:\n"
-            "        while True:\n"
-            "            _try_slack_digest()\n"
-            "            run_cycle()\n"
+            "        with cycle_lock():\n"
+            "            while True:\n"
+            "                _try_slack_digest()\n"
+            "                run_cycle()\n"
             "    finally:\n"
             "        release_lock()\n"
         )

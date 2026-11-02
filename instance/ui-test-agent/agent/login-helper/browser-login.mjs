@@ -8,6 +8,7 @@ const TARGET_URL = process.env.UI_TEST_TARGET_URL;
 const TARGET_HOST = 'console.stage.redhat.com';
 const SHARED_CDP_URL = process.env.UI_TEST_CDP_URL || 'http://127.0.0.1:9222';
 const LOGIN_DEADLINE_MS = 200_000;
+const SHOW_COOKIE_PROMPT = process.env.UI_HARNESS_SHOW_COOKIE_PROMPT === '1';
 const SSO_HOSTS = new Set([
   'sso.stage.redhat.com',
   'sso.redhat.com',
@@ -108,7 +109,7 @@ async function transferSession(storageState, targetUrl, browsers) {
       localStorage.setItem(name, value);
     }
   }, sessionOrigins(storageState));
-  await disableCookiePrompt(page);
+  if (!SHOW_COOKIE_PROMPT) await disableCookiePrompt(page);
   await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   if (!(await hasSignedInUserMenu(page, 45000))) {
     throw new Error('Transferred Stage session was not confirmed in the agent browser.');
