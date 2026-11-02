@@ -12,6 +12,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import TypedDict
 from urllib.error import URLError
@@ -35,6 +36,10 @@ login_lock = threading.Lock()
 CREDENTIALS_DIR = Path(
     os.environ.pop("UI_TEST_CREDENTIALS_DIR", "") or "/var/run/ui-test-credentials"
 )
+HARNESS_PROFILE = os.environ.pop("UI_HARNESS_PROFILE", "")
+HARNESS_USERNAME = os.environ.pop("UI_TEST_USERNAME", "")
+HARNESS_PASSWORD = os.environ.pop("UI_TEST_PASSWORD", "")
+HARNESS_SHOW_COOKIE_PROMPT = os.environ.pop("UI_HARNESS_SHOW_COOKIE_PROMPT", "") == "1"
 ALIAS_PATTERN = re.compile(r"[A-Za-z0-9:_-]{1,80}\Z")
 PUBLIC_MESSAGES = {
     "blocked": "The login helper could not prepare or access Stage sign-in.",
@@ -68,9 +73,17 @@ class LoginResult(TypedDict, total=False):
     credential_submission_started: bool
 
 
+attempts: deque[LoginResult] = deque(maxlen=100)
+
+
 def _credentials_for(alias: str) -> tuple[str, str] | None:
     """Resolve a profile inside the helper, never from a request credential."""
     if not ALIAS_PATTERN.fullmatch(alias):
+        return None
+
+    if HARNESS_PROFILE:
+        if HARNESS_USERNAME and HARNESS_PASSWORD and alias == HARNESS_PROFILE:
+            return HARNESS_USERNAME, HARNESS_PASSWORD
         return None
 
     try:
@@ -113,6 +126,10 @@ async def health(_request: Request) -> JSONResponse:
     if await asyncio.to_thread(_chromium_cdp_ready):
         return JSONResponse({"status": "ok"})
     return JSONResponse({"status": "browser_unavailable"}, status_code=503)
+
+
+async def harness_state(_request: Request) -> JSONResponse:
+    return JSONResponse({"attempts": list(attempts)})
 
 
 async def sign_in_endpoint(request: Request) -> JSONResponse:
@@ -185,6 +202,8 @@ def _sign_in(alias: str) -> LoginResult:
         result["profile_alias"] = alias
     if status == "authentication_failed" or submission_started:
         password_submission_at = time.monotonic()
+    if HARNESS_PROFILE:
+        attempts.append(dict(result))
     return result
 
 
@@ -202,6 +221,10 @@ def _run_browser_login(node: str, username: str, password: str) -> LoginResult:
             "PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers"
         ),
     }
+    if HARNESS_PROFILE:
+        helper_env["UI_HARNESS_SHOW_COOKIE_PROMPT"] = (
+            "1" if HARNESS_SHOW_COOKIE_PROMPT else ""
+        )
     process = None
     try:
         process = subprocess.Popen(
@@ -341,6 +364,16 @@ def _start_chromium(profile_dir: Path) -> subprocess.Popen | None:
     raise RuntimeError("Chromium DevTools did not become ready within 60 seconds.")
 
 
+def create_app() -> Starlette:
+    routes = [
+        Route("/health", health),
+        Route("/sign-in", sign_in_endpoint, methods=["POST"]),
+    ]
+    if HARNESS_PROFILE:
+        routes.append(Route("/__harness/state", harness_state))
+    return Starlette(routes=routes)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -357,12 +390,7 @@ def main() -> None:
     try:
         browser = _start_chromium(PROFILE_DIR)
         uvicorn.run(
-            Starlette(
-                routes=[
-                    Route("/health", health),
-                    Route("/sign-in", sign_in_endpoint, methods=["POST"]),
-                ]
-            ),
+            create_app(),
             host=args.host,
             port=args.port,
             access_log=False,

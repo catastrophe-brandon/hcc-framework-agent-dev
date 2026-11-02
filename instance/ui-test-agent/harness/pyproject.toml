@@ -1,0 +1,27 @@
+[project]
+name = "ui-test-agent-harness"
+version = "0.1.0"
+description = "Local tooling for the Hybrid Cloud Console UI testing agent"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+servers = [
+    "mcp>=1.1.0",
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.12.8"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"] # Embedded HTML and prompt text use content-oriented line breaks.
