@@ -1,0 +1,14 @@
+{
+  "viewer": {
+    "username": "viewer@example.test",
+    "password": "dummy-viewer-password",
+    "auth_context": "Read-only viewer",
+    "org_display": "UI Test Fixture Org"
+  },
+  "org-admin": {
+    "username": "admin@example.test",
+    "password": "dummy-admin-password",
+    "auth_context": "Organization administrator",
+    "org_display": "UI Test Fixture Org"
+  }
+}

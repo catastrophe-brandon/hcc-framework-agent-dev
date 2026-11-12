@@ -12,6 +12,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import TypedDict
 from urllib.error import URLError
@@ -35,6 +36,10 @@ login_lock = threading.Lock()
 CREDENTIALS_DIR = Path(
     os.environ.pop("UI_TEST_CREDENTIALS_DIR", "") or "/var/run/ui-test-credentials"
 )
+HARNESS_PROFILE = os.environ.pop("UI_HARNESS_PROFILE", "")
+HARNESS_USERNAME = os.environ.pop("UI_TEST_USERNAME", "")
+HARNESS_PASSWORD = os.environ.pop("UI_TEST_PASSWORD", "")
+HARNESS_SHOW_COOKIE_PROMPT = os.environ.pop("UI_HARNESS_SHOW_COOKIE_PROMPT", "") == "1"
 ALIAS_PATTERN = re.compile(r"[A-Za-z0-9:_-]{1,80}\Z")
 PUBLIC_MESSAGES = {
     "blocked": "The login helper could not prepare or access Stage sign-in.",
@@ -54,10 +59,40 @@ PUBLIC_MESSAGES = {
         "the account and org context."
     ),
 }
+DIAGNOSTIC_CODES = {
+    "authenticated",
+    "browser_context_failed",
+    "browser_launch_failed",
+    "browser_process_exit_nonzero",
+    "browser_process_output_invalid",
+    "browser_process_start_failed",
+    "browser_process_timeout",
+    "cookie_prompt_failed",
+    "credentials_rejected",
+    "helper_configuration_missing",
+    "helper_deadline_exceeded",
+    "invalid_browser_result",
+    "login_flow_failed",
+    "node_unavailable",
+    "password_cooldown_active",
+    "profile_credentials_unavailable",
+    "proxy_missing",
+    "session_transfer_failed",
+    "signin_form_not_found",
+    "sso_lockdown",
+    "sso_submission_failed",
+    "stage_host_not_reached",
+    "stage_identity_confirmation_failed",
+    "stage_navigation_failed",
+    "unknown",
+    "user_avatar_not_visible",
+}
+NETWORK_ERROR_CODE = re.compile(r"ERR_[A-Z0-9_]{1,64}\Z")
 SIGN_IN_INCOMPLETE = {
     "status": "blocked",
     "message": "The login helper could not complete the Stage sign-in flow.",
-    "credential_submission_started": True,
+    "diagnostic_code": "browser_process_timeout",
+    "credential_submission_started": None,
 }
 
 
@@ -65,12 +100,22 @@ class LoginResult(TypedDict, total=False):
     status: str
     message: str
     profile_alias: str
-    credential_submission_started: bool
+    credential_submission_started: bool | None
+    diagnostic_code: str
+    network_error_code: str
+
+
+attempts: deque[LoginResult] = deque(maxlen=100)
 
 
 def _credentials_for(alias: str) -> tuple[str, str] | None:
     """Resolve a profile inside the helper, never from a request credential."""
     if not ALIAS_PATTERN.fullmatch(alias):
+        return None
+
+    if HARNESS_PROFILE:
+        if HARNESS_USERNAME and HARNESS_PASSWORD and alias == HARNESS_PROFILE:
+            return HARNESS_USERNAME, HARNESS_PASSWORD
         return None
 
     try:
@@ -92,27 +137,55 @@ def _credentials_for(alias: str) -> tuple[str, str] | None:
 
 
 def _public_login_result(payload: object) -> LoginResult:
-    """Allow only known statuses and fixed messages from the browser process."""
+    """Allow only fixed, non-sensitive diagnostics from the browser process."""
     if not isinstance(payload, dict):
-        return {"status": "blocked", "message": PUBLIC_MESSAGES["blocked"]}
+        return {
+            "status": "blocked",
+            "message": PUBLIC_MESSAGES["blocked"],
+            "diagnostic_code": "invalid_browser_result",
+            "credential_submission_started": None,
+        }
 
     status = payload.get("status")
     if not isinstance(status, str) or status not in PUBLIC_MESSAGES:
-        return {"status": "blocked", "message": PUBLIC_MESSAGES["blocked"]}
+        return {
+            "status": "blocked",
+            "message": PUBLIC_MESSAGES["blocked"],
+            "diagnostic_code": "invalid_browser_result",
+            "credential_submission_started": None,
+        }
 
-    return {
+    result: LoginResult = {
         "status": status,
         "message": PUBLIC_MESSAGES[status],
-        "credential_submission_started": bool(
-            payload.get("credential_submission_started", False)
+        "credential_submission_started": (
+            payload.get("credential_submission_started")
+            if isinstance(payload.get("credential_submission_started"), bool)
+            else None
         ),
     }
+    diagnostic_code = payload.get("diagnostic_code")
+    result["diagnostic_code"] = (
+        diagnostic_code
+        if isinstance(diagnostic_code, str) and diagnostic_code in DIAGNOSTIC_CODES
+        else "unknown"
+    )
+    network_error_code = payload.get("network_error_code")
+    if isinstance(network_error_code, str) and NETWORK_ERROR_CODE.fullmatch(
+        network_error_code
+    ):
+        result["network_error_code"] = network_error_code
+    return result
 
 
 async def health(_request: Request) -> JSONResponse:
     if await asyncio.to_thread(_chromium_cdp_ready):
         return JSONResponse({"status": "ok"})
     return JSONResponse({"status": "browser_unavailable"}, status_code=503)
+
+
+async def harness_state(_request: Request) -> JSONResponse:
+    return JSONResponse({"attempts": list(attempts)})
 
 
 async def sign_in_endpoint(request: Request) -> JSONResponse:
@@ -157,6 +230,8 @@ def _sign_in(alias: str) -> LoginResult:
         return {
             "status": "blocked",
             "message": "A password was submitted recently. Stop this request and continue on a later cycle.",
+            "diagnostic_code": "password_cooldown_active",
+            "credential_submission_started": False,
         }
 
     credentials = _credentials_for(alias)
@@ -164,6 +239,8 @@ def _sign_in(alias: str) -> LoginResult:
         return {
             "status": "blocked",
             "message": "No credentials are configured for that profile alias.",
+            "diagnostic_code": "profile_credentials_unavailable",
+            "credential_submission_started": False,
         }
 
     node = shutil.which("node")
@@ -171,20 +248,28 @@ def _sign_in(alias: str) -> LoginResult:
         return {
             "status": "blocked",
             "message": "Node.js is unavailable to the login helper.",
+            "diagnostic_code": "node_unavailable",
+            "credential_submission_started": False,
         }
 
     result = _run_browser_login(node, *credentials)
     status = result.get("status")
-    submission_started = bool(result.pop("credential_submission_started", False))
+    submission_started = result.pop("credential_submission_started", None)
+    submission_observed = submission_started is True
     if status == "authenticated":
-        if not submission_started:
+        if not submission_observed:
             return {
                 "status": "login_unconfirmed",
                 "message": PUBLIC_MESSAGES["login_unconfirmed"],
+                "diagnostic_code": "unknown",
+                "credential_submission_started": submission_started,
             }
         result["profile_alias"] = alias
-    if status == "authentication_failed" or submission_started:
+    if status == "authentication_failed" or submission_started is not False:
         password_submission_at = time.monotonic()
+    result["credential_submission_started"] = submission_started
+    if HARNESS_PROFILE:
+        attempts.append(dict(result))
     return result
 
 
@@ -197,11 +282,18 @@ def _run_browser_login(node: str, username: str, password: str) -> LoginResult:
         "UI_TEST_PASSWORD": password,
         "UI_TEST_TARGET_URL": TARGET_URL,
         "UI_TEST_CDP_URL": CDP_URL,
+        "UI_TEST_CHROMIUM_EXECUTABLE": os.environ.get(
+            "UI_TEST_CHROMIUM_EXECUTABLE", ""
+        ),
         "UI_BROWSER_PROXY": os.environ.get("UI_BROWSER_PROXY", ""),
         "PLAYWRIGHT_BROWSERS_PATH": os.environ.get(
             "PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers"
         ),
     }
+    if HARNESS_PROFILE:
+        helper_env["UI_HARNESS_SHOW_COOKIE_PROMPT"] = (
+            "1" if HARNESS_SHOW_COOKIE_PROMPT else ""
+        )
     process = None
     try:
         process = subprocess.Popen(
@@ -232,20 +324,28 @@ def _run_browser_login(node: str, username: str, password: str) -> LoginResult:
         return {
             "status": "blocked",
             "message": PUBLIC_MESSAGES["blocked"],
+            "diagnostic_code": "browser_process_start_failed",
             "credential_submission_started": False,
         }
 
     try:
         payload = json.loads(stdout) if stdout.strip() else {}
     except json.JSONDecodeError:
-        return dict(SIGN_IN_INCOMPLETE)
+        return {
+            **SIGN_IN_INCOMPLETE,
+            "diagnostic_code": "browser_process_output_invalid",
+        }
     status = payload.get("status") if isinstance(payload, dict) else None
-    if (
-        process.returncode != 0
-        or not isinstance(status, str)
-        or status not in PUBLIC_MESSAGES
-    ):
-        return dict(SIGN_IN_INCOMPLETE)
+    if process.returncode != 0:
+        return {
+            **SIGN_IN_INCOMPLETE,
+            "diagnostic_code": "browser_process_exit_nonzero",
+        }
+    if not isinstance(status, str) or status not in PUBLIC_MESSAGES:
+        return {
+            **SIGN_IN_INCOMPLETE,
+            "diagnostic_code": "invalid_browser_result",
+        }
     return _public_login_result(payload)
 
 
@@ -341,6 +441,16 @@ def _start_chromium(profile_dir: Path) -> subprocess.Popen | None:
     raise RuntimeError("Chromium DevTools did not become ready within 60 seconds.")
 
 
+def create_app() -> Starlette:
+    routes = [
+        Route("/health", health),
+        Route("/sign-in", sign_in_endpoint, methods=["POST"]),
+    ]
+    if HARNESS_PROFILE:
+        routes.append(Route("/__harness/state", harness_state))
+    return Starlette(routes=routes)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -357,12 +467,7 @@ def main() -> None:
     try:
         browser = _start_chromium(PROFILE_DIR)
         uvicorn.run(
-            Starlette(
-                routes=[
-                    Route("/health", health),
-                    Route("/sign-in", sign_in_endpoint, methods=["POST"]),
-                ]
-            ),
+            create_app(),
             host=args.host,
             port=args.port,
             access_log=False,
