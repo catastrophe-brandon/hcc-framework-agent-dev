@@ -306,15 +306,18 @@ def _limit_runtime_to_one_cycle(runtime: Path) -> None:
     # so a local harness run exits cleanly without changing the checked-out source.
     runner_module = runtime / "bot" / "run.py"
     runner_source = runner_module.read_text(encoding="utf-8")
-    cycle_loop = "            while True:"
-    if runner_source.count(cycle_loop) != 1:
+    cycle_loop = re.compile(r"(?m)^([ \t]*)while True:$")
+    cycle_matches = list(cycle_loop.finditer(runner_source))
+    if len(cycle_matches) != 1:
         raise RuntimeError(
             "Could not locate the dev-bot main cycle loop to limit the harness run"
         )
-    runner_source = runner_source.replace(
-        cycle_loop,
-        "            for _cycle in range(1):",
-        1,
+    cycle_match = cycle_matches[0]
+    runner_source = (
+        runner_source[: cycle_match.start()]
+        + cycle_match.group(1)
+        + "for _cycle in range(1):"
+        + runner_source[cycle_match.end() :]
     )
     sleep_call = "    time.sleep(sleep_seconds)"
     if runner_source.count(sleep_call) != 1:
