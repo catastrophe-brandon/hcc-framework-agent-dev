@@ -19,6 +19,23 @@ const AUTH_ORIGINS = new Set([TARGET_HOST, ...SSO_HOSTS]);
 const AUTH_COOKIE_DOMAINS = new Set([...AUTH_ORIGINS, 'redhat.com']);
 let credentialSubmissionStarted = false;
 
+function diagnosticResult(
+  status,
+  diagnosticCode,
+  submitted = credentialSubmissionStarted,
+  error = null,
+) {
+  const result = {
+    status,
+    diagnostic_code: diagnosticCode,
+    credential_submission_started: submitted,
+  };
+  const message = error instanceof Error ? error.message : '';
+  const networkError = message.match(/net::(ERR_[A-Z0-9_]{1,64})\b/);
+  if (networkError) result.network_error_code = networkError[1];
+  return result;
+}
+
 async function hasSignedInUserMenu(page, timeout = 5000) {
   try {
     await page
@@ -67,6 +84,7 @@ function browserEnvironment() {
   delete env.UI_TEST_PASSWORD;
   delete env.UI_HARNESS_USERNAME;
   delete env.UI_HARNESS_PASSWORD;
+  delete env.UI_TEST_CHROMIUM_EXECUTABLE;
   return env;
 }
 
@@ -119,61 +137,78 @@ async function transferSession(storageState, targetUrl, browsers) {
 
 async function runLogin(username, password, browsers) {
   const proxy = process.env.UI_BROWSER_PROXY;
-  if (!proxy) return { status: 'blocked', credential_submission_started: false };
+  if (!proxy) return diagnosticResult('blocked', 'proxy_missing', false);
 
-  const loginBrowser = await chromium.launch({
-    headless: true,
-    proxy: { server: proxy },
-    env: browserEnvironment(),
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-extensions',
-      '--ignore-certificate-errors',
-      '--host-resolver-rules=MAP consent.trustarc.com 127.0.0.1',
-      '--proxy-bypass-list=localhost;127.0.0.1;::1',
-    ],
-  });
-  browsers.login = loginBrowser;
-  const context = await loginBrowser.newContext({ ignoreHTTPSErrors: true });
-  const page = await context.newPage();
-  page.setDefaultTimeout(15000);
-  page.setDefaultNavigationTimeout(30000);
+  let loginBrowser;
+  let page;
+  let phase = 'browser_launch_failed';
   try {
+    const launchOptions = {
+      headless: true,
+      proxy: { server: proxy },
+      env: browserEnvironment(),
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-extensions',
+        '--ignore-certificate-errors',
+        '--host-resolver-rules=MAP consent.trustarc.com 127.0.0.1',
+        '--proxy-bypass-list=localhost;127.0.0.1;::1',
+      ],
+    };
+    if (process.env.UI_TEST_CHROMIUM_EXECUTABLE) {
+      launchOptions.executablePath = process.env.UI_TEST_CHROMIUM_EXECUTABLE;
+    }
+    loginBrowser = await chromium.launch(launchOptions);
+    browsers.login = loginBrowser;
+    phase = 'browser_context_failed';
+    const context = await loginBrowser.newContext({ ignoreHTTPSErrors: true });
+    page = await context.newPage();
+    page.setDefaultTimeout(15000);
+    page.setDefaultNavigationTimeout(30000);
+
+    phase = 'cookie_prompt_failed';
     await disableCookiePrompt(page);
+
+    phase = 'stage_navigation_failed';
     await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    phase = 'signin_form_not_found';
     const usernameField = page.getByLabel('Red Hat login').first();
     try {
       await usernameField.waitFor({ state: 'visible', timeout: 15000 });
     } catch {
-      return { status: 'sign_in_form_not_found', credential_submission_started: false };
+      return diagnosticResult('sign_in_form_not_found', 'signin_form_not_found', false);
     }
 
     credentialSubmissionStarted = true;
+    phase = 'sso_submission_failed';
     await redHatSsoLogin(withBaseUrl(page), username, password);
+    phase = 'stage_identity_confirmation_failed';
     if (new URL(page.url()).hostname !== TARGET_HOST) {
-      return { status: 'login_unconfirmed', credential_submission_started: true };
-    }
-    if (!(await hasSignedInUserMenu(page, 45000))) {
-      return { status: 'login_unconfirmed', credential_submission_started: true };
+      return diagnosticResult('login_unconfirmed', 'stage_host_not_reached', true);
     }
 
+    phase = 'user_avatar_not_visible';
+    if (!(await hasSignedInUserMenu(page, 45000))) {
+      return diagnosticResult('login_unconfirmed', 'user_avatar_not_visible', true);
+    }
+
+    phase = 'session_transfer_failed';
     await transferSession(await context.storageState(), TARGET_URL, browsers);
-    return { status: 'authenticated', credential_submission_started: true };
+    return diagnosticResult('authenticated', 'authenticated', true);
   } catch (error) {
     if (/Invalid login credentials/i.test(error instanceof Error ? error.message : '')) {
-      return { status: 'authentication_failed', credential_submission_started: credentialSubmissionStarted };
+      return diagnosticResult('authentication_failed', 'credentials_rejected', true);
     }
     if (/Lockdown/i.test(error instanceof Error ? error.message : '')) {
-      return { status: 'blocked', credential_submission_started: credentialSubmissionStarted };
+      return diagnosticResult('blocked', 'sso_lockdown', credentialSubmissionStarted, error);
     }
-    return {
-      status: credentialSubmissionStarted ? 'login_unconfirmed' : 'blocked',
-      credential_submission_started: credentialSubmissionStarted,
-    };
+    const status = credentialSubmissionStarted ? 'login_unconfirmed' : 'blocked';
+    return diagnosticResult(status, phase, credentialSubmissionStarted, error);
   } finally {
-    await clearLoginFields(page);
-    await loginBrowser.close();
+    if (page) await clearLoginFields(page).catch(() => {});
+    if (loginBrowser) await loginBrowser.close().catch(() => {});
   }
 }
 
@@ -190,7 +225,7 @@ async function main() {
   const username = process.env.UI_TEST_USERNAME;
   const password = process.env.UI_TEST_PASSWORD;
   if (!username || !password || !TARGET_URL) {
-    return { status: 'blocked', credential_submission_started: false };
+    return diagnosticResult('blocked', 'helper_configuration_missing', false);
   }
 
   const browsers = {};
@@ -206,11 +241,13 @@ async function main() {
         }, LOGIN_DEADLINE_MS);
       }),
     ]);
-  } catch {
-    return {
-      status: credentialSubmissionStarted ? 'login_unconfirmed' : 'blocked',
-      credential_submission_started: credentialSubmissionStarted,
-    };
+  } catch (error) {
+    const status = credentialSubmissionStarted ? 'login_unconfirmed' : 'blocked';
+    const diagnosticCode =
+      error instanceof Error && /deadline exceeded/i.test(error.message)
+        ? 'helper_deadline_exceeded'
+        : 'login_flow_failed';
+    return diagnosticResult(status, diagnosticCode, credentialSubmissionStarted, error);
   } finally {
     clearTimeout(deadline);
     await closeBrowsers(browsers);
@@ -219,8 +256,9 @@ async function main() {
 
 main().then(
   (result) => process.stdout.write(`${JSON.stringify(result)}\n`),
-  () => process.stdout.write(`${JSON.stringify({
-    status: 'blocked',
-    credential_submission_started: credentialSubmissionStarted,
-  })}\n`),
+  () => process.stdout.write(`${JSON.stringify(diagnosticResult(
+    'blocked',
+    'login_flow_failed',
+    credentialSubmissionStarted,
+  ))}\n`),
 );

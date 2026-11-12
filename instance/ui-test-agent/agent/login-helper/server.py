@@ -59,10 +59,40 @@ PUBLIC_MESSAGES = {
         "the account and org context."
     ),
 }
+DIAGNOSTIC_CODES = {
+    "authenticated",
+    "browser_context_failed",
+    "browser_launch_failed",
+    "browser_process_exit_nonzero",
+    "browser_process_output_invalid",
+    "browser_process_start_failed",
+    "browser_process_timeout",
+    "cookie_prompt_failed",
+    "credentials_rejected",
+    "helper_configuration_missing",
+    "helper_deadline_exceeded",
+    "invalid_browser_result",
+    "login_flow_failed",
+    "node_unavailable",
+    "password_cooldown_active",
+    "profile_credentials_unavailable",
+    "proxy_missing",
+    "session_transfer_failed",
+    "signin_form_not_found",
+    "sso_lockdown",
+    "sso_submission_failed",
+    "stage_host_not_reached",
+    "stage_identity_confirmation_failed",
+    "stage_navigation_failed",
+    "unknown",
+    "user_avatar_not_visible",
+}
+NETWORK_ERROR_CODE = re.compile(r"ERR_[A-Z0-9_]{1,64}\Z")
 SIGN_IN_INCOMPLETE = {
     "status": "blocked",
     "message": "The login helper could not complete the Stage sign-in flow.",
-    "credential_submission_started": True,
+    "diagnostic_code": "browser_process_timeout",
+    "credential_submission_started": None,
 }
 
 
@@ -70,7 +100,9 @@ class LoginResult(TypedDict, total=False):
     status: str
     message: str
     profile_alias: str
-    credential_submission_started: bool
+    credential_submission_started: bool | None
+    diagnostic_code: str
+    network_error_code: str
 
 
 attempts: deque[LoginResult] = deque(maxlen=100)
@@ -105,21 +137,45 @@ def _credentials_for(alias: str) -> tuple[str, str] | None:
 
 
 def _public_login_result(payload: object) -> LoginResult:
-    """Allow only known statuses and fixed messages from the browser process."""
+    """Allow only fixed, non-sensitive diagnostics from the browser process."""
     if not isinstance(payload, dict):
-        return {"status": "blocked", "message": PUBLIC_MESSAGES["blocked"]}
+        return {
+            "status": "blocked",
+            "message": PUBLIC_MESSAGES["blocked"],
+            "diagnostic_code": "invalid_browser_result",
+            "credential_submission_started": None,
+        }
 
     status = payload.get("status")
     if not isinstance(status, str) or status not in PUBLIC_MESSAGES:
-        return {"status": "blocked", "message": PUBLIC_MESSAGES["blocked"]}
+        return {
+            "status": "blocked",
+            "message": PUBLIC_MESSAGES["blocked"],
+            "diagnostic_code": "invalid_browser_result",
+            "credential_submission_started": None,
+        }
 
-    return {
+    result: LoginResult = {
         "status": status,
         "message": PUBLIC_MESSAGES[status],
-        "credential_submission_started": bool(
-            payload.get("credential_submission_started", False)
+        "credential_submission_started": (
+            payload.get("credential_submission_started")
+            if isinstance(payload.get("credential_submission_started"), bool)
+            else None
         ),
     }
+    diagnostic_code = payload.get("diagnostic_code")
+    result["diagnostic_code"] = (
+        diagnostic_code
+        if isinstance(diagnostic_code, str) and diagnostic_code in DIAGNOSTIC_CODES
+        else "unknown"
+    )
+    network_error_code = payload.get("network_error_code")
+    if isinstance(network_error_code, str) and NETWORK_ERROR_CODE.fullmatch(
+        network_error_code
+    ):
+        result["network_error_code"] = network_error_code
+    return result
 
 
 async def health(_request: Request) -> JSONResponse:
@@ -174,6 +230,8 @@ def _sign_in(alias: str) -> LoginResult:
         return {
             "status": "blocked",
             "message": "A password was submitted recently. Stop this request and continue on a later cycle.",
+            "diagnostic_code": "password_cooldown_active",
+            "credential_submission_started": False,
         }
 
     credentials = _credentials_for(alias)
@@ -181,6 +239,8 @@ def _sign_in(alias: str) -> LoginResult:
         return {
             "status": "blocked",
             "message": "No credentials are configured for that profile alias.",
+            "diagnostic_code": "profile_credentials_unavailable",
+            "credential_submission_started": False,
         }
 
     node = shutil.which("node")
@@ -188,20 +248,26 @@ def _sign_in(alias: str) -> LoginResult:
         return {
             "status": "blocked",
             "message": "Node.js is unavailable to the login helper.",
+            "diagnostic_code": "node_unavailable",
+            "credential_submission_started": False,
         }
 
     result = _run_browser_login(node, *credentials)
     status = result.get("status")
-    submission_started = bool(result.pop("credential_submission_started", False))
+    submission_started = result.pop("credential_submission_started", None)
+    submission_observed = submission_started is True
     if status == "authenticated":
-        if not submission_started:
+        if not submission_observed:
             return {
                 "status": "login_unconfirmed",
                 "message": PUBLIC_MESSAGES["login_unconfirmed"],
+                "diagnostic_code": "unknown",
+                "credential_submission_started": submission_started,
             }
         result["profile_alias"] = alias
-    if status == "authentication_failed" or submission_started:
+    if status == "authentication_failed" or submission_started is not False:
         password_submission_at = time.monotonic()
+    result["credential_submission_started"] = submission_started
     if HARNESS_PROFILE:
         attempts.append(dict(result))
     return result
@@ -216,6 +282,9 @@ def _run_browser_login(node: str, username: str, password: str) -> LoginResult:
         "UI_TEST_PASSWORD": password,
         "UI_TEST_TARGET_URL": TARGET_URL,
         "UI_TEST_CDP_URL": CDP_URL,
+        "UI_TEST_CHROMIUM_EXECUTABLE": os.environ.get(
+            "UI_TEST_CHROMIUM_EXECUTABLE", ""
+        ),
         "UI_BROWSER_PROXY": os.environ.get("UI_BROWSER_PROXY", ""),
         "PLAYWRIGHT_BROWSERS_PATH": os.environ.get(
             "PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers"
@@ -255,20 +324,28 @@ def _run_browser_login(node: str, username: str, password: str) -> LoginResult:
         return {
             "status": "blocked",
             "message": PUBLIC_MESSAGES["blocked"],
+            "diagnostic_code": "browser_process_start_failed",
             "credential_submission_started": False,
         }
 
     try:
         payload = json.loads(stdout) if stdout.strip() else {}
     except json.JSONDecodeError:
-        return dict(SIGN_IN_INCOMPLETE)
+        return {
+            **SIGN_IN_INCOMPLETE,
+            "diagnostic_code": "browser_process_output_invalid",
+        }
     status = payload.get("status") if isinstance(payload, dict) else None
-    if (
-        process.returncode != 0
-        or not isinstance(status, str)
-        or status not in PUBLIC_MESSAGES
-    ):
-        return dict(SIGN_IN_INCOMPLETE)
+    if process.returncode != 0:
+        return {
+            **SIGN_IN_INCOMPLETE,
+            "diagnostic_code": "browser_process_exit_nonzero",
+        }
+    if not isinstance(status, str) or status not in PUBLIC_MESSAGES:
+        return {
+            **SIGN_IN_INCOMPLETE,
+            "diagnostic_code": "invalid_browser_result",
+        }
     return _public_login_result(payload)
 
 

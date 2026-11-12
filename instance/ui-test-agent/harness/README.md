@@ -261,12 +261,20 @@ directory is retained under `/tmp/ui-test-agent-results-*`; when the agent posts
 a report, `jira-report.md` contains the readable Jira comment, while
 `summary.json` keeps the structured harness checks. The directory also contains
 fixture state, costs, logs, and the model transcript. The runner
-scrubs configured UI credentials from persisted text files and records
-whether it detected a leak. Stage result bundles omit screenshot attachments
+scrubs configured UI credentials from persisted text files. In `summary.json`,
+`credential_leak_detected` flags credential text found in captured fixture
+state, while `credential_text_redacted` records that local text artifacts
+needed scrubbing. Stage result bundles omit screenshot attachments
 so images of identity forms cannot retain entered values. The runner allows up
 to 150 model turns by default; override with `--max-turns` (1–200) for a shorter
 or bounded cycle. The default cycle timeout is 900 seconds; override with
 `--timeout` when needed.
+
+## Potential enhancements
+
+- **Visible browser mode:** Add an opt-in setting for local harness runs so a
+  developer can watch the browser interactions as they happen. Keep headless
+  execution as the default. This is an idea only; the option is not implemented.
 
 ## What this does not verify
 

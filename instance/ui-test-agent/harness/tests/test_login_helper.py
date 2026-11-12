@@ -20,6 +20,7 @@ ENVIRONMENT_KEYS = (
     "UI_TEST_CREDENTIALS_DIR",
     "UI_TEST_USERNAME",
     "UI_TEST_PASSWORD",
+    "UI_TEST_CHROMIUM_EXECUTABLE",
     "UI_HARNESS_PROFILE",
     "UI_HARNESS_SHOW_COOKIE_PROMPT",
 )
@@ -165,12 +166,16 @@ class LoginHelperTests(unittest.TestCase):
             patch.object(
                 self.helper.subprocess, "Popen", return_value=process
             ) as popen,
+            patch.dict(os.environ, {"UI_TEST_CHROMIUM_EXECUTABLE": "/usr/bin/chrome"}),
         ):
             result = self.helper.sign_in("org-admin")
 
         passed_environment = popen.call_args.kwargs["env"]
         self.assertEqual(passed_environment["UI_TEST_USERNAME"], "test-user")
         self.assertEqual(passed_environment["UI_TEST_PASSWORD"], "secret-pass")
+        self.assertEqual(
+            passed_environment["UI_TEST_CHROMIUM_EXECUTABLE"], "/usr/bin/chrome"
+        )
         self.assertNotIn("JIRA_TOKEN", passed_environment)
         self.assertEqual(result["status"], "authenticated")
         self.assertEqual(result["profile_alias"], "org-admin")
@@ -180,6 +185,38 @@ class LoginHelperTests(unittest.TestCase):
             process.communicate.call_args.kwargs["timeout"],
             self.helper.BROWSER_LOGIN_TIMEOUT_SECONDS,
         )
+
+    def test_browser_result_keeps_only_allowlisted_safe_diagnostics(self):
+        result = self.helper._public_login_result(
+            {
+                "status": "blocked",
+                "diagnostic_code": "stage_navigation_failed",
+                "network_error_code": "ERR_TUNNEL_CONNECTION_FAILED",
+                "credential_submission_started": False,
+                "message": "https://sso.stage.redhat.com secret-pass test-user",
+                "password": "secret-pass",
+            }
+        )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["diagnostic_code"], "stage_navigation_failed")
+        self.assertEqual(result["network_error_code"], "ERR_TUNNEL_CONNECTION_FAILED")
+        self.assertIs(result["credential_submission_started"], False)
+        self.assertNotIn("sso.stage.redhat.com", json.dumps(result))
+        self.assertNotIn("secret-pass", json.dumps(result))
+        self.assertNotIn("test-user", json.dumps(result))
+
+        rejected = self.helper._public_login_result(
+            {
+                "status": "blocked",
+                "diagnostic_code": "https://sso.stage.redhat.com?token=secret",
+                "network_error_code": "secret-pass",
+                "credential_submission_started": None,
+            }
+        )
+        self.assertEqual(rejected["diagnostic_code"], "unknown")
+        self.assertNotIn("network_error_code", rejected)
+        self.assertIsNone(rejected["credential_submission_started"])
 
     def test_credentials_are_entered_before_session_transfer_to_shared_cdp(self):
         script = (HELPER_PATH.parent / "browser-login.mjs").read_text(encoding="utf-8")
@@ -198,6 +235,10 @@ class LoginHelperTests(unittest.TestCase):
         )
         self.assertNotIn("connectOverCDP", login_flow)
         self.assertNotIn("--remote-debugging-port", private_launch)
+        self.assertIn(
+            "launchOptions.executablePath = process.env.UI_TEST_CHROMIUM_EXECUTABLE",
+            login_flow,
+        )
         self.assertIn("delete env.UI_TEST_USERNAME", script)
         self.assertIn("delete env.UI_TEST_PASSWORD", script)
 
@@ -289,6 +330,8 @@ class LoginHelperTests(unittest.TestCase):
             result = self.helper.sign_in("org-admin")
 
         self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["diagnostic_code"], "browser_process_timeout")
+        self.assertIsNone(result["credential_submission_started"])
         process.send_signal.assert_called_once_with(signal.SIGTERM)
 
     def test_unknown_alias_is_not_echoed_or_sent_to_node(self):

@@ -502,7 +502,7 @@ def _capture_state(artifacts: Path, secrets: list[str], target: str) -> dict:
 
 
 def _sanitize_artifacts(artifacts: Path, secrets: list[str]) -> bool:
-    """Redact fixture credentials from persisted text artifacts."""
+    """Redact local text artifacts and report whether credential text was found."""
     leaked = False
     text_suffixes = {".json", ".jsonl", ".log", ".md", ".txt"}
     for path in artifacts.rglob("*"):
@@ -805,6 +805,8 @@ def main():
                 "UI_HARNESS_PROFILE": args.profile,
                 "UI_TEST_USERNAME": username,
                 "UI_TEST_PASSWORD": password,
+                "UI_TEST_CHROMIUM_EXECUTABLE": chromium,
+                "UI_BROWSER_PROXY": chrome_proxy,
                 "UI_HARNESS_SHOW_COOKIE_PROMPT": parent_env.get(
                     "UI_HARNESS_SHOW_COOKIE_PROMPT", ""
                 ),
@@ -961,12 +963,12 @@ def main():
                 transcript_dir, artifacts / "transcripts", dirs_exist_ok=True
             )
 
-        credential_leak = captured["credential_leak_detected"] or _sanitize_artifacts(
-            artifacts, secrets
-        )
+        credential_text_redacted = _sanitize_artifacts(artifacts, secrets)
+        credential_leak = captured["credential_leak_detected"]
         if args.target == "stage":
             _remove_stage_screenshots(artifacts)
         snapshot["credential_leak_detected"] = credential_leak
+        snapshot["credential_text_redacted"] = credential_text_redacted
         if reports:
             report_body = _redact(reports[-1]["body"], secrets)
             (artifacts / "jira-report.md").write_text(

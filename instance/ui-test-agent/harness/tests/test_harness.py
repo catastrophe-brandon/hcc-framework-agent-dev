@@ -345,6 +345,48 @@ class PreflightHarnessTests(unittest.TestCase):
 
 
 class RuntimeHarnessTests(unittest.TestCase):
+    def test_stage_login_helper_uses_harness_chromium_and_proxy(self):
+        source = Path(run_agent_cycle.__file__).read_text(encoding="utf-8")
+
+        self.assertIn('"UI_TEST_CHROMIUM_EXECUTABLE": chromium', source)
+        self.assertIn('"UI_BROWSER_PROXY": chrome_proxy', source)
+
+    def test_capture_state_redacts_credentials_before_writing_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            artifacts = Path(tmp_dir)
+            with patch.object(
+                run_agent_cycle,
+                "_http_json",
+                return_value={
+                    "message": "Login for test-user with secret-pass succeeded."
+                },
+            ):
+                result = run_agent_cycle._capture_state(
+                    artifacts, ["test-user", "secret-pass"], "stage"
+                )
+
+            stored_state = (artifacts / "state.json").read_text(encoding="utf-8")
+            self.assertTrue(result["credential_leak_detected"])
+            self.assertNotIn("test-user", stored_state)
+            self.assertNotIn("secret-pass", stored_state)
+            self.assertIn("[REDACTED]", stored_state)
+
+    def test_local_artifact_redaction_is_reported_after_scrubbing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            artifacts = Path(tmp_dir)
+            trace = artifacts / "transcript.jsonl"
+            trace.write_text('{"text":"test-user"}\n', encoding="utf-8")
+
+            redacted = run_agent_cycle._sanitize_artifacts(
+                artifacts, ["test-user", "secret-pass"]
+            )
+
+            self.assertTrue(redacted)
+            self.assertEqual(
+                trace.read_text(encoding="utf-8"),
+                '{"text":"[REDACTED]"}\n',
+            )
+
     def test_runner_copy_is_limited_to_one_cycle(self):
         source = (
             "def _read_sleep_signal():\n"
@@ -683,6 +725,14 @@ class InstanceConfigTests(unittest.TestCase):
         )
         self.assertEqual(set(targets["default_urls"]), {"dev", "stage", "prod"})
         self.assertTrue(all(targets["default_urls"].values()))
+
+    def test_workflow_forbids_recording_sign_in_usernames(self):
+        workflow = (
+            INSTANCE_DIR / "agent" / "workflows" / "ui-test" / "CLAUDE.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("never copy usernames or email addresses", workflow)
+        self.assertIn("configured profile alias, verification outcome", workflow)
 
 
 if __name__ == "__main__":
